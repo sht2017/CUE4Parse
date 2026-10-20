@@ -230,12 +230,14 @@ public static class TextureDecoder
     private static void DecodeTexture(UTexture texture, FTexture2DMipMap? mip, ETexturePlatform platform, out byte[] data, out EPixelFormat colorType, out int sizeX, out int sizeY, out int sizeZ)
     {
         var format = texture.Format;
-        if (mip?.BulkData?.Data is not { Length: > 0 })
+        // Read without caching the payload in the mip (the decoded result is what callers keep), so a texture object that
+        // stays loaded does not also keep its compressed mips.
+        var bytes = mip?.BulkData?.ReadDataOnce();
+        if (mip is null || bytes is not { Length: > 0 })
             throw new ParserException("Supplied MipMap is null or has empty data!");
         if (!PixelFormatUtils.PixelFormats.TryGetValue(format, out var formatInfo) || !formatInfo.Supported || formatInfo.BlockBytes == 0)
             throw new NotImplementedException($"The supplied pixel format {format} is not supported!");
 
-        var bytes = mip.BulkData.Data;
         sizeX = mip.SizeX;
         sizeY = mip.SizeY;
         sizeZ = mip.SizeZ;

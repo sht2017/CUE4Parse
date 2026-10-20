@@ -10,6 +10,7 @@ using CUE4Parse.UE4.Objects.Core.Math;
 using CUE4Parse.UE4.Objects.Core.Misc;
 using CUE4Parse.UE4.Objects.Engine;
 using CUE4Parse.UE4.Objects.UObject;
+using CUE4Parse.UE4.Exceptions;
 using CUE4Parse.UE4.Versions;
 using Newtonsoft.Json;
 
@@ -88,6 +89,44 @@ public partial class USkeletalMesh : USkinnedAsset
             Ar.Position += sizeof(int); // int - SkeletalDepth
         }
 
+        if (Globals.DeferSkeletalMeshRenderData)
+        {
+            // The rest is read from here when the render data is first used (EnsureRenderData).
+            deferredRenderData = (FAssetArchive) Ar.Clone();
+            deferredValidPos = validPos;
+            deferredStripDataFlags = stripDataFlags;
+            Ar.Position = validPos;
+            return;
+        }
+        DeserializeRenderData(Ar, validPos, stripDataFlags);
+    }
+
+    private FAssetArchive? deferredRenderData;
+    private long deferredValidPos;
+    private FStripDataFlags deferredStripDataFlags;
+    private readonly object renderDataGate = new();
+
+    protected override void EnsureRenderData()
+    {
+        // The reader itself (and a thread that waited for it) sees what is set so far, as the read without deferral does.
+        if (deferredRenderData is null || Monitor.IsEntered(renderDataGate)) return;
+        lock (renderDataGate)
+        {
+            if (deferredRenderData is not { } Ar) return;
+            try { DeserializeRenderData(Ar, deferredValidPos, deferredStripDataFlags); }
+            catch (Exception e)
+            {
+                // As the package's object read reports an export that does not read (AbstractUePackage.DeserializeObject).
+                if (Globals.FatalObjectSerializationErrors) throw new ParserException($"Could not read {ExportType} named {Name} correctly", e);
+                if (e is ParserException) Serilog.Log.Error(e, "Could not read {0} named {1} correctly", ExportType, Name);
+                else Serilog.Log.Error(e, "Could not read {0} named {1} correctly ({2})", ExportType, Name, Ar.Name);
+            }
+            finally { deferredRenderData = null; }
+        }
+    }
+
+    private void DeserializeRenderData(FAssetArchive Ar, long validPos, FStripDataFlags stripDataFlags)
+    {
         if (FSkeletalMeshCustomVersion.Get(Ar) < FSkeletalMeshCustomVersion.Type.SplitModelAndRenderData)
         {
             LODModels = Ar.Game switch

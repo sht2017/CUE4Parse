@@ -23,6 +23,25 @@ public sealed record IoOptionalSegment(FArchive Archive, Func<FByteBulkDataHeade
 public sealed class IoPackage : AbstractUePackage
 {
     private readonly IoGlobalData _globalData;
+    private readonly IVfsFileProvider? _vfsProvider;
+    private readonly Func<UObject>?[] _exportFactories;
+
+    /// <summary>
+    /// Lets go of every export read so far: the next use of one reads it again from the package's bytes, the same way
+    /// (objects already handed out stay valid). For a walk over a large level, so the level does not hold all of its read
+    /// actors at once. Returns how many were let go.
+    /// </summary>
+    public int ReleaseLoadedExports()
+    {
+        var released = 0;
+        for (var i = 0; i < ExportsLazy.Length; i++)
+        {
+            if (ExportsLazy[i] is not { IsValueCreated: true } || _exportFactories[i] is not { } factory) continue;
+            ExportsLazy[i] = new Lazy<UObject>(factory);
+            released++;
+        }
+        return released;
+    }
     private readonly EGame _game;
 
     public override FPackageFileSummary Summary { get; }
@@ -95,6 +114,7 @@ public sealed class IoPackage : AbstractUePackage
         : base(uasset.Name.SubstringBeforeLast('.'), provider, archiveName)
     {
         _globalData = provider?.GlobalData ?? throw new ParserException("Found IoStore Package but global data is missing, can't serialize");
+        _vfsProvider = provider;
 
         var baseRealm = ReadRealm(uasset, containerHeader, provider, false, 0);
         _game = baseRealm.Archive.Game;
@@ -136,6 +156,7 @@ public sealed class IoPackage : AbstractUePackage
 
         // Populate lazy exports, the optional segment directly follows the base realm exports
         ExportsLazy = new Lazy<UObject>[ExportMapLength];
+        _exportFactories = new Func<UObject>?[ExportMapLength];
         foreach (var realm in _realms) PopulateExports(realm);
 
         IsFullyLoaded = true;
@@ -486,7 +507,8 @@ public sealed class IoPackage : AbstractUePackage
                 return 0; // Skip ExportCommandType_Create
 
             var export = realm.ExportMap[entry.LocalExportIndex];
-            ExportsLazy[realm.ExportBaseIndex + (int) entry.LocalExportIndex] = new Lazy<UObject>(() =>
+            var exportIndex = realm.ExportBaseIndex + (int) entry.LocalExportIndex;
+            ExportsLazy[exportIndex] = new Lazy<UObject>(_exportFactories[exportIndex] = () =>
             {
                 // Create
                 var obj = ConstructObject(ResolveObjectIndex(realm, export.ClassIndex), this, export.ObjectFlags);
@@ -592,14 +614,13 @@ public sealed class IoPackage : AbstractUePackage
         if (index.IsPackageImport)
         {
             var importedPublicExportHashes = realm.ImportedPublicExportHashes;
-            var importedPackages = realm.ImportedPackages.Value;
             if (importedPublicExportHashes != null)
             {
                 var packageImportRef = index.AsPackageImportRef;
-                if (packageImportRef.ImportedPackageIndex < importedPackages.Length)
+                if (packageImportRef.ImportedPackageIndex < realm.ImportedPackageIds.Length)
                 {
                     var exportHash = importedPublicExportHashes[packageImportRef.ImportedPublicExportHashIndex];
-                    var pkg = importedPackages[packageImportRef.ImportedPackageIndex];
+                    var pkg = ImportedPackage(realm, (int) packageImportRef.ImportedPackageIndex);
                     if (pkg?.FindExportByPublicExportHash(exportHash) is { } export)
                     {
                         return export;
@@ -632,6 +653,7 @@ public sealed class IoPackage : AbstractUePackage
             }
             else if (_game is GAME_UE5_EA_Legacy or GAME_TheMatrixAwakens)
             {
+                var importedPackages = realm.ImportedPackages.Value;
                 // Pre-finalization Zen: the low 32 bits of a package import reference are the target export's 32-bit export hash.
                 var packageImportRef = index.AsPackageImportRef;
                 if (packageImportRef.ImportedPackageIndex < importedPackages.Length)
@@ -651,7 +673,7 @@ public sealed class IoPackage : AbstractUePackage
             }
             else
             {
-                foreach (var pkg in importedPackages)
+                foreach (var pkg in realm.ImportedPackages.Value)
                 {
                     if (pkg?.FindExportByGlobalImportIndex(index) is { } export)
                     {
@@ -693,6 +715,37 @@ public sealed class IoPackage : AbstractUePackage
 
         return null;
     }
+
+    /// <summary>
+    /// The package an import of <paramref name="realm"/> is in: with <see cref="Globals.WeakImportedPackages"/> only that
+    /// package is loaded, held weakly and loaded again through the provider once collected (a package that does not load is
+    /// not tried again); without it, every imported package at once, held for the package's lifetime.
+    /// </summary>
+    private IoPackage? ImportedPackage(RealmData realm, int i)
+    {
+        if (!Globals.WeakImportedPackages || realm.ImportedPackages.IsValueCreated) return realm.ImportedPackages.Value[i];
+        var id = realm.ImportedPackageIds[i];
+        // An optional segment references exports of the package it belongs to, which is this one.
+        if (id.Equals(realm.PackageId)) return this;
+        var weak = realm.ImportedWeak;
+        if (weak is null)
+        {
+            Interlocked.CompareExchange(ref realm.ImportedWeak, new WeakReference<IoPackage>?[realm.ImportedPackageIds.Length], null);
+            weak = realm.ImportedWeak!;
+        }
+        var entry = Volatile.Read(ref weak[i]);
+        if (entry is not null)
+        {
+            if (ReferenceEquals(entry, MissingImport)) return null;
+            if (entry.TryGetTarget(out var alive)) return alive;
+        }
+        IoPackage? loaded = null;
+        _vfsProvider?.TryLoadPackage(id, out loaded);
+        Volatile.Write(ref weak[i], loaded is null ? MissingImport : new WeakReference<IoPackage>(loaded));
+        return loaded;
+    }
+
+    private static readonly WeakReference<IoPackage> MissingImport = new(null!);
 
     /// <summary>
     /// Resolves an export index of the unified export table (base realm first, then optional segment).
@@ -759,6 +812,7 @@ public sealed class IoPackage : AbstractUePackage
         public int ExportBaseIndex;
         public Lazy<IoPackage?[]> ImportedPackages = null!;
         public Lazy<IPackage?[][]> ImportedPackagesAllVersions = null!;
+        public WeakReference<IoPackage>?[]? ImportedWeak;
     }
 
     private class ResolvedPakExportObject(int exportIndex, Package package) : ResolvedObject(package, exportIndex)

@@ -336,6 +336,50 @@ public static class TextureEncoder
         return InstallPixels(dataSpan, convertedData, info);
     }
 
+    /// <summary>
+    /// The texture as straight RGBA8 with rows packed, in managed memory: the bytes <see cref="ToSkBitmap"/> reads back as
+    /// <see cref="SKColorType.Rgba8888"/> / <see cref="SKAlphaType.Unpremul"/>, without the native copy and the read-back.
+    /// Null for the formats it does not cover (those convert through <see cref="ToSkBitmap"/>). The result may be
+    /// <see cref="CTexture.Data"/> itself.
+    /// </summary>
+    public static byte[]? ToRgba8888(this CTexture texture)
+    {
+        var bytes = (long)texture.Width * texture.Height * 4;
+        var data = texture.Data;
+        switch (texture.PixelFormat)
+        {
+            case EPixelFormat.PF_R8G8B8A8 when data.Length >= bytes:
+                return data.Length == bytes ? data : data.AsSpan(0, (int)bytes).ToArray();
+            case EPixelFormat.PF_A8R8G8B8 or EPixelFormat.PF_B8G8R8A8 when data.Length >= bytes:
+            {
+                var rgba = new byte[bytes];
+                for (var i = 0; i < rgba.Length; i += 4)
+                {
+                    rgba[i] = data[i + 2];
+                    rgba[i + 1] = data[i + 1];
+                    rgba[i + 2] = data[i];
+                    rgba[i + 3] = data[i + 3];
+                }
+                return rgba;
+            }
+            case EPixelFormat.PF_R8 or EPixelFormat.PF_G8 when data.Length >= bytes / 4:
+            {
+                var rgba = new byte[bytes];
+                for (int i = 0, p = 0; p < rgba.Length; i++, p += 4)
+                {
+                    var v = data[i];
+                    rgba[p] = v;
+                    rgba[p + 1] = v;
+                    rgba[p + 2] = v;
+                    rgba[p + 3] = 255;
+                }
+                return rgba;
+            }
+            default:
+                return null;
+        }
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static byte Convert16To8(ushort value)
     {
